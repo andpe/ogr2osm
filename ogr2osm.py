@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 ''' ogr2osm beta
@@ -52,6 +52,7 @@ l.basicConfig(level=l.DEBUG, format="%(message)s")
 from osgeo import ogr
 from osgeo import osr
 from geom import *
+import networkx as nx
 
 # Determine major Python version is 2 or 3
 IS_PYTHON2 = sys.version_info < (3, 0)
@@ -458,7 +459,7 @@ def parsePoint(ogrgeometry):
     return geometry
 
 linestring_points = {}
-def parseLineString(ogrgeometry):
+def parseLineString(ogrgeometry, geo=None):
     geometry = Way()
     # LineString.GetPoint() returns a tuple, so we can't call parsePoint on it
     # and instead have to create the point ourself
@@ -472,8 +473,10 @@ def parseLineString(ogrgeometry):
         else:
             mypoint = Point(x, y)
             linestring_points[(rx,ry)] = mypoint
+        
         geometry.points.append(mypoint)
         mypoint.addparent(geometry)
+
     return geometry
 
 def parsePolygon(ogrgeometry):
@@ -483,7 +486,7 @@ def parsePolygon(ogrgeometry):
         l.warning("Polygon with no rings?")
     elif ogrgeometry.GetGeometryCount() == 1:
         result = parseLineString(ogrgeometry.GetGeometryRef(0))
-        if result.points > options.maxNodesPerWay:
+        if len(result.points) > options.maxNodesPerWay:
             global longWaysFromPolygons
             longWaysFromPolygons.add(result)
         return result
@@ -524,9 +527,98 @@ def parseCollection(ogrgeometry):
     elif (geometryType == ogr.wkbMultiLineString or
           geometryType == ogr.wkbMultiLineString25D):
         geometries = []
+        result = []
+        id_to_point = {}
+        w = Way()
+
         for linestring in range(ogrgeometry.GetGeometryCount()):
             geometries.append(parseLineString(ogrgeometry.GetGeometryRef(linestring)))
-        return geometries
+
+        for geometry in geometries:
+            for point in geometry.points:
+                # Replace the road with a placeholder
+                id_to_point[point.id] = point
+                point.addparent(w)
+                point.removeparent(geometry)
+
+            # Remove this road from the dataset
+            try:
+                Geometry.geometries.remove(geometry)
+            except ValueError:
+                pass  # Ignore any missing geometries
+
+        # We have to do this since QGIS couldn't handle it...
+        G = nx.Graph()
+
+        # If there's more than one way, then we want to check if they should be one or not.
+        if len(geometries) > 2:
+            for i in range(len(geometries)):
+                # Add nodes and connect them with an edge.
+                G.add_node(geometries[i].points[0].id)
+                G.add_node(geometries[i].points[1].id)
+                G.add_edge(geometries[i].points[0].id, geometries[i].points[1].id)
+
+                # Compare to the rest of the geometries.
+                for j in range(len(geometries)):
+                    # Skip comparing ourselves
+                    if i == j:
+                        continue
+
+                    G.add_node(geometries[j].points[0].id)
+                    G.add_node(geometries[j].points[1].id)
+
+                    # If i_0 = j_1 then i_1 is connected to j_1.
+                    if geometries[i].points[0].id == geometries[j].points[1].id:
+                        G.add_edge(geometries[j].points[1].id, geometries[i].points[1].id)
+
+            # Identify connected components in this graph.
+            components = nx.connected_component_subgraphs(G)
+            for component in components:
+                # Find a starting node (degree = 1 means it's not in the middle at least)
+                start = None
+                for node in component.nodes():
+                    if component.degree(node) == 1:
+                        start = node
+                        break
+
+                # Create a starting way.
+                way = Way()
+                if len(component.nodes()) > 1 and len(component.edges()) > 1:
+                    # Find reachable paths and loop through them to build the ways.
+                    reachable = nx.dfs_edges(G, start)
+                    fresh = True
+                    previous = None
+                    for pair in reachable:
+                        # If we're on the first pair, add both pints otherwise
+                        # just add the second point of the pair. If we can't
+                        # find a matching node then it's a new way.
+                        if fresh:
+                            way.points.extend([id_to_point[x] for x in pair])
+                            previous = pair[1]
+                            fresh = False
+                        elif previous == pair[0]:
+                            way.points.append(id_to_point[pair[1]])
+                            previous = pair[1]
+                        else:
+                            result.append(way)
+                            way = Way()
+                            way.points.extend([id_to_point[x] for x in pair])
+                            previous = pair[1]
+
+                # Add any stray ways still not added
+                if len(way.points) > 0:
+                    result.append(way)
+        else:
+            result = geometries
+
+        for geom in result:
+            for point in geom.points:
+                point.addparent(geom)
+                point.removeparent(w)
+
+        Geometry.geometries.remove(w)
+
+        return result
     else:
         geometry = Relation()
         for i in range(ogrgeometry.GetGeometryCount()):
@@ -728,6 +820,6 @@ translations.preOutputTransform(Geometry.geometries, Feature.features)
 output()
 if options.saveid:
     with open(options.saveid, 'wb') as ff:
-        ff.write(str(Geometry.elementIdCounter))
+        ff.write(str(Geometry.elementIdCounter).encode('utf-8'))
     l.info("Wrote elementIdCounter '%d' to file '%s'"
         % (Geometry.elementIdCounter, options.saveid))
